@@ -1,0 +1,28 @@
+[project]
+name = "video-sematic-search"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "waritboonmasiri",email = "warit.boonmasiri@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+package-mode = false
+
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14" # Python requirement moves here
+streamlit = ">=1.50.0,<2.0.0"
+"opencv-python" = ">=4.12.0.88,<5.0.0.0"
+imageio = ">=2.37.0,<3.0.0"
+"imageio-ffmpeg" = ">=0.6.0,<0.7.0"
+jupyter = ">=1.1.1,<2.0.0"
+# This is the correct dictionary format for Poetry's dependencies table
+moviepy = "^2.2.1"
+
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
