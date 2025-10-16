@@ -1,34 +1,41 @@
 import streamlit as st
 import torch
-from transformers import CLIPProcessor, CLIPModel
-from PIL import Image
 import numpy as np
 import tempfile
 import moviepy as mp
 import os
+from PIL import Image
 
-# --- Configuration ---
-# Use a standard CLIP model as the encoder foundation
-MODEL_NAME = "openai/clip-vit-base-patch32"
-FRAME_COUNT = 32  # Number of frames to sample from the video
-EMBEDDING_DIM = 512  # Dimension of CLIP-ViT-B/32 embedding
-CLIP_MODEL_URL = "https://huggingface.co/openai/clip-vit-base-patch32"
+
+# --- Configuration for X-CLIP Model ---
+# We use a base X-CLIP model that is available on Hugging Face
+MODEL_NAME = "microsoft/xclip-base-patch16"
 
 
 # --- Initialization ---
 
 @st.cache_resource
-def load_clip_model():
-    """Loads the CLIP model and processor."""
-    with st.spinner("Loading CLIP model... This happens once."):
-        model = CLIPModel.from_pretrained(MODEL_NAME)
-        processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+def load_xclip_model():
+    """Loads the X-CLIP model and processor only once."""
+    try:
+        from transformers import XCLIPProcessor, XCLIPModel
+        st.write(f"Loading X-CLIP model: {MODEL_NAME}...")
+
+        # Load the model and its processor (which handles video and text inputs)
+        model = XCLIPModel.from_pretrained(MODEL_NAME)
+        processor = XCLIPProcessor.from_pretrained(MODEL_NAME)
         model.eval()
-    return model, processor
+        return model, processor
+    except ImportError:
+        st.error("Error: The XCLIP classes were not found. Please ensure you have the latest 'transformers' library.")
+        return None, None
 
 
 # Load model globally
-clip_model, clip_processor = load_clip_model()
+xclip_model, xclip_processor = load_xclip_model()
+
+if not xclip_model:
+    st.stop()
 
 # Global state for the vector database
 if 'video_db' not in st.session_state:
@@ -36,90 +43,134 @@ if 'video_db' not in st.session_state:
     st.session_state.video_ids = []
 
 
-# --- Core Video Processing and Alignment ---
+# --- Core Video Processing and Retrieval ---
 
-def get_video_embeddings_and_temporal_info(video_path, num_frames=FRAME_COUNT):
+def extract_video_frames(video_path, num_frames=8):
     """
-    Extracts frame features and a global feature for a video.
-    Returns: Global (aggregated) embedding, a 3D tensor of frame embeddings, and frame timestamps.
+    Extracts a list of PIL Images from the video. The number of frames
+    is defined by the model's processor config (typically 8-16 for X-CLIP).
+    This function replaces the manual frame sampling loop in the previous code.
     """
     try:
         clip = mp.VideoFileClip(video_path)
         duration = clip.duration
 
-        # Calculate time points for frame sampling
+        # Determine sampling times
         frame_timestamps = np.linspace(0, duration, num_frames, endpoint=False)
 
-        frame_embeddings = []
+        frames = [
+            Image.fromarray(clip.get_frame(t))
+            for t in frame_timestamps
+        ]
 
-        for t in frame_timestamps:
-            frame_pil = Image.fromarray(clip.get_frame(t))
-            inputs = clip_processor(images=frame_pil, return_tensors="pt")
-
-            with torch.no_grad():
-                # Get the embedding for the frame
-                frame_features = clip_model.get_image_features(inputs["pixel_values"])
-
-            # Normalize and append
-            frame_embeddings.append(frame_features / frame_features.norm(dim=-1, keepdim=True))
-
-        # (N_frames, 1, D) -> (N_frames, D)
-        frame_embeddings_tensor = torch.stack(frame_embeddings).squeeze(1)
-
-        # Global Video Feature (for overall relevance)
-        # In the original X-CLIP, a Transformer refines this, but here we use mean pooling
-        global_embedding = frame_embeddings_tensor.mean(dim=0)
-
-        return global_embedding.cpu().numpy(), frame_embeddings_tensor.cpu().numpy(), frame_timestamps
-
+        return frames, frame_timestamps, duration
     except Exception as e:
-        st.error(f"Error processing video: {e}")
-        return None, None, None
+        st.error(f"Error extracting frames from video: {e}")
+        return [], [], 0
 
 
-def get_text_embedding(text):
-    """Computes the CLIP embedding for a text query."""
-    inputs = clip_processor(text=[text], return_tensors="pt", padding=True)
+def get_video_and_text_features(video_frames, query_text):
+    """
+    Computes both the video and text embeddings using the X-CLIP processor/model.
+
+    NOTE: When calling get_video_features, we only need to pass 'pixel_values'.
+    When calling get_text_features, we only need to pass 'input_ids' and 'attention_mask'.
+    """
+    # 1. Process inputs for both modalities
+    inputs = xclip_processor(
+        videos=video_frames,
+        text=[query_text],
+        return_tensors="pt",
+        padding=True
+    )
+
     with torch.no_grad():
-        text_features = clip_model.get_text_features(**inputs)
-    # Normalize
-    return (text_features / text_features.norm(dim=-1, keepdim=True)).squeeze().cpu().numpy()
+        # 2. Get Video Features (Corrected Call)
+        # We pass only the required positional argument 'pixel_values'
+        outputs_video_f = xclip_model.get_video_features(
+            pixel_values=inputs.pixel_values
+        )
+
+        # 3. Get Text Features (Corrected Call)
+        # We pass only the text arguments
+        outputs_text_f = xclip_model.get_text_features(
+            input_ids=inputs.input_ids,
+            attention_mask=inputs.attention_mask
+        )
+
+        # Normalize and convert to NumPy
+        video_features = outputs_video_f / outputs_video_f.norm(dim=-1, keepdim=True)
+        text_features = outputs_text_f / outputs_text_f.norm(dim=-1, keepdim=True)
+
+        return video_features.squeeze().cpu().numpy(), text_features.squeeze().cpu().numpy()
 
 
-def find_best_moment(text_embedding, frame_embeddings, timestamps, moment_duration=5.0):
+def find_best_moment_xclip(video_path, query_text, duration, max_clips=10):
     """
-    Simulates X-CLIP's local alignment by finding the frame most similar to the query.
-
-    Returns: (start_time, end_time, max_similarity)
+    Performs a simplified temporal grounding by slicing the video and scoring sub-clips.
+    This simulates the moment retrieval capability.
     """
-    # frame_embeddings shape: (N_frames, D)
-    # text_embedding shape: (D,)
+    # XCLIP's actual temporal grounding is complex, so we simulate it by scoring
+    # overlapping short clips of the video.
 
-    # 1. Calculate similarity score for every frame
-    # (N_frames, D) dot (D,) -> (N_frames,)
-    frame_similarities = np.dot(frame_embeddings, text_embedding)
+    clip_duration = 5.0  # e.g., 5-second window
+    step_size = 2.0  # Slide the window by 2 seconds
 
-    # 2. Find the frame with the highest similarity
-    best_frame_index = np.argmax(frame_similarities)
-    max_similarity = frame_similarities[best_frame_index]
+    best_similarity = -1.0
+    best_moment = (0.0, clip_duration)
 
-    # 3. Determine the 5-second moment around that frame
-    best_time = timestamps[best_frame_index]
+    # Generate overlapping 5-second time windows
+    timestamps = np.arange(0.0, duration - step_size, step_size)
 
-    # Calculate half the moment duration
-    half_moment = moment_duration / 2
+    for start_t in timestamps:
+        end_t = min(start_t + clip_duration, duration)
 
-    # Ensure the moment stays within the video boundaries
-    start_time = max(0.0, best_time - half_moment)
-    end_time = min(timestamps[-1] + (timestamps[1] - timestamps[0]), best_time + half_moment)
+        # Skip very short trailing segments
+        if end_t - start_t < step_size:
+            continue
 
-    return start_time, end_time, max_similarity
+            # 1. Extract frames for the *sub-clip*
+        sub_clip_frames = []
+        try:
+            clip = mp.VideoFileClip(video_path)
+            # Sample 8 frames within this sub-clip (the model's expectation)
+            frame_times = np.linspace(start_t, end_t, 8, endpoint=False)
+            sub_clip_frames = [Image.fromarray(clip.get_frame(t)) for t in frame_times]
+        except Exception:
+            continue
+
+        if not sub_clip_frames:
+            continue
+
+        # 2. Get the sub-clip's embedding and the text embedding
+        # We reuse the model's logic for the text feature, but only compute once for efficiency
+
+        # We only need the video feature for the sub-clip
+        video_inputs = xclip_processor(videos=sub_clip_frames, return_tensors="pt")
+        text_inputs = xclip_processor(text=[query_text], return_tensors="pt")
+
+        with torch.no_grad():
+            video_features_sub = xclip_model.get_video_features(video_inputs.pixel_values)  # <-- Already correct!
+            text_features_sub = xclip_model.get_text_features(text_inputs.input_ids, text_inputs.attention_mask)
+
+            # Normalize
+            video_features_sub = video_features_sub / video_features_sub.norm(dim=-1, keepdim=True)
+            text_features_sub = text_features_sub / text_features_sub.norm(dim=-1, keepdim=True)
+
+            # Calculate similarity
+            similarity = torch.dot(video_features_sub.squeeze(), text_features_sub.squeeze()).item()
+
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_moment = (start_t, end_t)
+
+    return best_moment, best_similarity
 
 
 # --- Streamlit UI ---
 
-st.title("🎬 X-CLIP Style Video Retrieval with Temporal Grounding")
-st.markdown(f"Using **{MODEL_NAME}** for feature extraction and **Frame-to-Text alignment** for temporal matching.")
+st.title("🎬 X-CLIP Semantic Search & Temporal Pinpointing")
+st.markdown("Retrieval is powered by the Hugging Face **`microsoft/xclip-base-patch16-v5`** model.")
 st.markdown("---")
 
 ## 1. Build/Update Video Database
@@ -137,23 +188,23 @@ if uploaded_file is not None:
             tmp_file.write(uploaded_file.read())
             temp_path = tmp_file.name
 
-        # 1. Get Embeddings
-        global_embed, frame_embeds, timestamps = get_video_embeddings_and_temporal_info(temp_path,
-                                                                                        num_frames=FRAME_COUNT)
+        # Extract frames and compute global features (using a dummy query for initial feature extraction)
+        video_frames, _, duration = extract_video_frames(temp_path)
 
-        if global_embed is not None:
-            # 2. Update database
+        if video_frames:
+            # We use a dummy text to get the global feature, as the model expects both inputs
+            global_embed, _ = get_video_and_text_features(video_frames, "a video")
+
+            # Update database
             st.session_state.video_db[video_name] = {
                 'path': temp_path,
                 'global_embedding': global_embed,
-                'frame_embeddings': frame_embeds,
-                'timestamps': timestamps
+                'duration': duration
             }
-            # 3. Update ID list
             st.session_state.video_ids = list(st.session_state.video_db.keys())
 
             progress_bar.progress(100, text=f"Processing {video_name}... Done!")
-            st.success(f"Video '{video_name}' added and indexed ({FRAME_COUNT} frames).")
+            st.success(f"Video '{video_name}' added to the database!")
         else:
             os.unlink(temp_path)  # Clean up temp file on error
 
@@ -169,34 +220,36 @@ st.markdown("---")
 st.header("2. Semantic Search and Moment Retrieval")
 
 query_text = st.text_input(
-    "Enter your text query:",
-    placeholder="e.g., A slow-motion shot of a cat jumping"
+    "Enter your search query:",
+    placeholder="e.g., A dog running across a field"
 )
 
 search_button = st.button("Search Videos & Find Moments", type="primary", disabled=not st.session_state.video_db)
 
 if search_button and query_text:
 
-    # 1. Get text query embedding (Global Text Feature)
+    # 1. Get query embedding
     with st.spinner(f"Encoding query: '{query_text}'..."):
-        query_embedding = get_text_embedding(query_text)
+        text_embedding = xclip_model.get_text_features(
+            **xclip_processor(text=[query_text], return_tensors="pt", padding=True)
+        )
+        text_embedding = text_embedding.squeeze().cpu().numpy()
 
-    st.subheader(f"Results for: **'{query_text}'**")
-
-    # List to hold video scores and details
+    st.subheader(f"Top Results for: **'{query_text}'**")
     video_scores = []
 
     # 2. Score All Videos (Global Retrieval)
     for video_name, data in st.session_state.video_db.items():
         # Global Similarity (Video-level match)
-        global_similarity = np.dot(data['global_embedding'], query_embedding)
+        global_similarity = np.dot(data['global_embedding'], text_embedding)
 
-        # Temporal Grounding (Local Frame Match)
-        start_t, end_t, max_local_sim = find_best_moment(
-            query_embedding,
-            data['frame_embeddings'],
-            data['timestamps']
-        )
+        # 3. Temporal Grounding (Local Match - Heavy Computation)
+        with st.spinner(f"Finding best moment in {video_name}..."):
+            (start_t, end_t), max_local_sim = find_best_moment_xclip(
+                data['path'],
+                query_text,
+                data['duration']
+            )
 
         video_scores.append({
             'name': video_name,
@@ -210,8 +263,8 @@ if search_button and query_text:
     # Sort by the global similarity score (overall video relevance)
     ranked_videos = sorted(video_scores, key=lambda x: x['global_similarity'], reverse=True)
 
-    # 3. Display Results
-    for rank, result in enumerate(ranked_videos[:5]):  # Show top 5 videos
+    # 4. Display Results
+    for rank, result in enumerate(ranked_videos[:3]):  # Show top 3 videos
 
         st.markdown(f"#### Rank {rank + 1}: {result['name']}")
 
@@ -227,9 +280,8 @@ if search_button and query_text:
         with col2:
             st.video(
                 result['path'],
-                start_time=int(result['start_time']),
-                # Note: 'moviepy' processes are expensive, limit the displayed segment length
+                start_time=int(result['start_time'])
             )
-            st.caption("Video starts at the most relevant moment.")
+            st.caption("Video playback starts at the pinned moment.")
 
         st.markdown("---")
